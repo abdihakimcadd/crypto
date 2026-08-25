@@ -1,0 +1,11 @@
+{
+  "name": "unified-poller",
+  "version": "1.0.0",
+  "main": "poller.js",
+  "scripts": { "start": "node poller.js" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5"
+  }
+}
