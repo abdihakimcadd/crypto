@@ -2,7 +2,10 @@
   "name": "unified-poller",
   "version": "1.0.0",
   "main": "poller.js",
-  "scripts": { "start": "node poller.js" },
+  "scripts": {
+    "build": "git clone https://github.com/whisperingotter29/tradingview-mcp.git tv-mcp && cd tv-mcp && npm install && npm run build",
+    "start": "node poller.js"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "@supabase/supabase-js": "^2.45.0",
