@@ -1,14 +1,13 @@
 // ============================================
-// UNIFIED POLLER — Railway
+// UNIFIED POLLER — Self-Calculated Indicators
+// Fetches: Binance 4h candles + positions
+// Calculates: EMA20/100/200, MACD/Signal/Histogram
+// Upserts to Supabase every 4 minutes
 // ============================================
-console.log('=== POLLER VERSION 2.0 ===');
+
 require('dotenv').config();
-const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
-const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 
 // ── CONFIG ──────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -16,48 +15,92 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY;
 const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET;
 const BINANCE_BASE_URL = 'https://fapi.binance.com';
-const POLL_INTERVAL_MS = 4 * 60 * 1000;
+
+const POLL_INTERVAL_MS = 4 * 60 * 1000; // 4 minutes
 const TIMEFRAME = '4h';
+const CANDLE_LIMIT = 500;
 const BATCH_SIZE = 5;
 const BATCH_DELAY_MS = 500;
 
-// ── FIND MCP SERVER ─────────────────────────
-function findMcpServer() {
-  console.log('Current directory:', process.cwd());
-  console.log('Directory contents:', fs.readdirSync('.'));
-  
-  const paths = [
-    './tv-mcp/build/index.js',
-    './tradingview-mcp/build/index.js',
-    '/app/tv-mcp/build/index.js',
-    '/app/tradingview-mcp/build/index.js'
-  ];
-  
-  for (const p of paths) {
-    const abs = path.resolve(p);
-    console.log(`Checking: ${abs} -> ${fs.existsSync(p) ? 'FOUND' : 'NOT FOUND'}`);
-    if (fs.existsSync(p)) return p;
-  }
-  return null;
-}
-
-const MCP_SERVER_PATH = findMcpServer();
-
-if (!MCP_SERVER_PATH) {
-  console.error('FATAL: TradingView MCP server not found anywhere.');
-  process.exit(1);
-}
-
-console.log('Using MCP server at:', MCP_SERVER_PATH);
-
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !BINANCE_API_KEY || !BINANCE_API_SECRET) {
-  console.error('Missing env vars');
+  console.error('Missing env vars: SUPABASE_URL, SUPABASE_SERVICE_KEY, BINANCE_API_KEY, BINANCE_API_SECRET');
   process.exit(1);
 }
 
 // ── SUPABASE ────────────────────────────────
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
+// ── MATH: EMA ───────────────────────────────
+function calculateEMA(closes, period) {
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+// ── MATH: MACD ──────────────────────────────
+function calculateMACD(closes) {
+  const k12 = 2 / 13;
+  const k26 = 2 / 27;
+  const k9 = 2 / 10;
+
+  let ema12 = closes.slice(0, 12).reduce((a, b) => a + b, 0) / 12;
+  const ema12Series = [ema12];
+  for (let i = 12; i < closes.length; i++) {
+    ema12 = closes[i] * k12 + ema12 * (1 - k12);
+    ema12Series.push(ema12);
+  }
+
+  let ema26 = closes.slice(0, 26).reduce((a, b) => a + b, 0) / 26;
+  const ema26Series = [ema26];
+  for (let i = 26; i < closes.length; i++) {
+    ema26 = closes[i] * k26 + ema26 * (1 - k26);
+    ema26Series.push(ema26);
+  }
+
+  const macdValues = [];
+  for (let i = 25; i < closes.length; i++) {
+    macdValues.push(ema12Series[i - 11] - ema26Series[i - 25]);
+  }
+
+  const macd = macdValues[macdValues.length - 1];
+  let signal = macdValues.slice(0, 9).reduce((a, b) => a + b, 0) / 9;
+  for (let i = 9; i < macdValues.length; i++) {
+    signal = macdValues[i] * k9 + signal * (1 - k9);
+  }
+
+  return {
+    macd,
+    signal,
+    histogram: macd - signal
+  };
+}
+
+// ── MATH: ALL INDICATORS ────────────────────
+function calculateAllIndicators(closes) {
+  const currentClose = closes[closes.length - 1];
+  const ema20 = calculateEMA(closes, 20);
+  const ema100 = calculateEMA(closes, 100);
+  const ema200 = calculateEMA(closes, 200);
+  const macdData = calculateMACD(closes);
+
+  return {
+    close_price: currentClose,
+    ema20,
+    ema100,
+    ema200,
+    macd: macdData.macd,
+    macd_signal: macdData.signal,
+    macd_histogram: macdData.histogram,
+    distance_ema20: ((currentClose - ema20) / ema20) * 100,
+    distance_ema100: ((currentClose - ema100) / ema100) * 100,
+    distance_ema200: ((currentClose - ema200) / ema200) * 100
+  };
+}
+
+// ── FETCH SYMBOLS ───────────────────────────
 async function getSymbols() {
   const { data, error } = await supabase
     .from('symbols')
@@ -67,66 +110,66 @@ async function getSymbols() {
   return data || [];
 }
 
-// ── TRADINGVIEW MCP ─────────────────────────
-async function createTvMcpClient() {
-  const transport = new StdioClientTransport({ command: 'node', args: [MCP_SERVER_PATH] });
-  const client = new Client({ name: 'dashboard-poller', version: '1.0' });
-  await client.connect(transport);
-  return { client, transport };
-}
-
-async function fetchTvIndicators(mcpClient, symbol) {
+// ── FETCH CANDLES FROM BINANCE ──────────────
+async function fetchCandles(symbolName) {
   try {
-    const tvSymbol = `BINANCE:${symbol.symbol_name}`;
-    const result = await mcpClient.callTool({
-      name: 'get_indicator_values',
-      arguments: {
-        symbol: tvSymbol,
-        timeframe: TIMEFRAME,
-        indicators: ['EMA20', 'EMA100', 'EMA200', 'MACD.macd', 'MACD.signal']
-      }
-    });
-    
-    const rawText = result.content?.[0]?.text || '{}';
-    let raw;
-    try { raw = JSON.parse(rawText); } catch (e) { return null; }
-    
-    const indicators = raw.indicators || raw;
-    const closePrice = parseFloat(raw.close || raw.price || indicators.close || indicators.price);
-    const ema20 = parseFloat(indicators.EMA20 || indicators.ema20);
-    const ema100 = parseFloat(indicators.EMA100 || indicators.ema100);
-    const ema200 = parseFloat(indicators.EMA200 || indicators.ema200);
-    const macd = parseFloat(indicators['MACD.macd'] || indicators.MACD || indicators.macd);
-    const macdSignal = parseFloat(indicators['MACD.signal'] || indicators.MACD_SIGNAL || indicators.macd_signal);
-    
-    if ([closePrice, ema20, ema100, ema200, macd, macdSignal].some(v => isNaN(v))) {
-      console.warn(`[${symbol.symbol_name}] Missing data`);
-      return null;
-    }
-    
-    return {
-      symbol_id: symbol.symbol_id,
-      snapshot_time: new Date().toISOString(),
-      close_price: closePrice,
-      ema20, ema100, ema200,
-      macd, macd_signal: macdSignal, macd_histogram: macd - macdSignal,
-      distance_ema20: ((closePrice - ema20) / ema20) * 100,
-      distance_ema100: ((closePrice - ema100) / ema100) * 100,
-      distance_ema200: ((closePrice - ema200) / ema200) * 100
-    };
+    const url = `${BINANCE_BASE_URL}/fapi/v1/klines?symbol=${symbolName}&interval=${TIMEFRAME}&limit=${CANDLE_LIMIT}`;
+    const res = await fetch(url);
+    if (!res.ok) { console.error(`[${symbolName}] HTTP ${res.status}`); return null; }
+    return await res.json();
   } catch (err) {
-    console.error(`[${symbol.symbol_name}] TV error:`, err.message);
+    console.error(`[${symbolName}] Error:`, err.message);
     return null;
   }
 }
 
-async function processTvBatch(mcpClient, symbols) {
+// ── STORE CANDLES ───────────────────────────
+async function storeCandles(symbolName, candles) {
+  await supabase.from('candle_data').delete().eq('symbol_name', symbolName);
+  const rows = candles.map(c => ({
+    symbol_name: symbolName,
+    open_time: c[0],
+    open_price: parseFloat(c[1]),
+    high_price: parseFloat(c[2]),
+    low_price: parseFloat(c[3]),
+    close_price: parseFloat(c[4]),
+    volume: parseFloat(c[5]),
+    close_time: c[6]
+  }));
+  const { error } = await supabase.from('candle_data').insert(rows);
+  if (error) { console.error(`[${symbolName}] Insert failed:`, error.message); return false; }
+  return true;
+}
+
+// ── PROCESS ONE SYMBOL ──────────────────────
+async function processSymbol(symbol) {
+  const candles = await fetchCandles(symbol.symbol_name);
+  if (!candles || candles.length === 0) return null;
+
+  await storeCandles(symbol.symbol_name, candles);
+
+  const closes = candles.map(c => parseFloat(c[4]));
+  const indicators = calculateAllIndicators(closes);
+
+  return {
+    symbol_id: symbol.symbol_id,
+    snapshot_time: new Date().toISOString(),
+    ...indicators
+  };
+}
+
+async function processSymbolsBatch(symbols) {
   const results = [];
   for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
     const batch = symbols.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.all(batch.map(s => fetchTvIndicators(mcpClient, s)));
+    console.log(`Batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(symbols.length / BATCH_SIZE)}: ${batch.map(s => s.symbol_name).join(', ')}`);
+
+    const batchResults = await Promise.all(batch.map(s => processSymbol(s)));
     results.push(...batchResults.filter(r => r !== null));
-    if (i + BATCH_SIZE < symbols.length) await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+
+    if (i + BATCH_SIZE < symbols.length) {
+      await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+    }
   }
   return results;
 }
@@ -139,9 +182,9 @@ async function fetchBinancePositions() {
     const signature = crypto.createHmac('sha256', BINANCE_API_SECRET).update(queryString).digest('hex');
     const url = `${BINANCE_BASE_URL}/fapi/v2/positionRisk?${queryString}&signature=${signature}`;
     const response = await fetch(url, { headers: { 'X-MBX-APIKEY': BINANCE_API_KEY } });
-    
+
     if (!response.ok) { console.error('Binance error:', await response.text()); return []; }
-    
+
     const data = await response.json();
     return data
       .filter(pos => parseFloat(pos.positionAmt) !== 0)
@@ -176,36 +219,36 @@ async function upsertPositions(positions) {
   console.log(`[${new Date().toISOString()}] Upserted ${positions.length} positions`);
 }
 
-// ── MAIN LOOP ───────────────────────────────
+// ── MAIN POLL LOOP ──────────────────────────
 async function runPoll() {
+  const startTime = Date.now();
   console.log(`\n========== POLL START ${new Date().toISOString()} ==========`);
-  let tvMcp, tvTransport;
+
   try {
-    const tv = await createTvMcpClient();
-    tvMcp = tv.client;
-    tvTransport = tv.transport;
-    
     const symbols = await getSymbols();
     console.log(`Symbols: ${symbols.length}`);
-    
-    const indicators = await processTvBatch(tvMcp, symbols);
+
+    const indicators = await processSymbolsBatch(symbols);
     await upsertIndicators(indicators);
-    
+
     const positions = await fetchBinancePositions();
     await upsertPositions(positions);
-    
-    console.log('Poll complete');
+
+    console.log(`Poll complete in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   } catch (err) {
     console.error('Poll failed:', err);
-  } finally {
-    if (tvTransport) try { await tvTransport.close(); } catch (e) {}
   }
 }
 
+// ── START ───────────────────────────────────
 async function main() {
-  console.log('Poller starting...');
+  console.log('Self-Calculation Poller Started');
+  console.log(`Interval: ${POLL_INTERVAL_MS / 60000} min | Candles: ${CANDLE_LIMIT} x ${TIMEFRAME}`);
   await runPoll();
   setInterval(runPoll, POLL_INTERVAL_MS);
 }
 
-main().catch(err => { console.error('Fatal:', err); process.exit(1); });
+main().catch(err => {
+  console.error('Fatal:', err);
+  process.exit(1);
+});
