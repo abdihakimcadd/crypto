@@ -1,6 +1,6 @@
 // ============================================
-// UNIFIED POLLER — Self-Calculated Indicators
-// Fetches: Binance 4h candles + positions
+// UNIFIED POLLER — Spot Market
+// Fetches: Binance Spot candles (no key needed) + account (key optional)
 // Calculates: EMA20/100/200, MACD/Signal/Histogram
 // Upserts to Supabase every 4 minutes
 // ============================================
@@ -12,20 +12,22 @@ const crypto = require('crypto');
 // ── CONFIG ──────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const BINANCE_API_KEY = process.env.BINANCE_API_KEY;
-const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET;
-const BINANCE_BASE_URL = 'https://fapi.binance.com';
+const BINANCE_API_KEY = process.env.BINANCE_API_KEY || '';
+const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET || '';
+const BINANCE_BASE_URL = 'https://api.binance.com';
 
-const POLL_INTERVAL_MS = 4 * 60 * 1000; // 4 minutes
+const POLL_INTERVAL_MS = 4 * 60 * 1000;
 const TIMEFRAME = '4h';
 const CANDLE_LIMIT = 500;
 const BATCH_SIZE = 5;
 const BATCH_DELAY_MS = 500;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !BINANCE_API_KEY || !BINANCE_API_SECRET) {
-  console.error('Missing env vars: SUPABASE_URL, SUPABASE_SERVICE_KEY, BINANCE_API_KEY, BINANCE_API_SECRET');
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY');
   process.exit(1);
 }
+
+const HAS_BINANCE_KEY = BINANCE_API_KEY && BINANCE_API_SECRET;
 
 // ── SUPABASE ────────────────────────────────
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
@@ -71,11 +73,7 @@ function calculateMACD(closes) {
     signal = macdValues[i] * k9 + signal * (1 - k9);
   }
 
-  return {
-    macd,
-    signal,
-    histogram: macd - signal
-  };
+  return { macd, signal, histogram: macd - signal };
 }
 
 // ── MATH: ALL INDICATORS ────────────────────
@@ -110,10 +108,10 @@ async function getSymbols() {
   return data || [];
 }
 
-// ── FETCH CANDLES FROM BINANCE ──────────────
+// ── FETCH CANDLES (SPOT, NO KEY NEEDED) ─────
 async function fetchCandles(symbolName) {
   try {
-    const url = `${BINANCE_BASE_URL}/fapi/v1/klines?symbol=${symbolName}&interval=${TIMEFRAME}&limit=${CANDLE_LIMIT}`;
+    const url = `${BINANCE_BASE_URL}/api/v3/klines?symbol=${symbolName}&interval=${TIMEFRAME}&limit=${CANDLE_LIMIT}`;
     const res = await fetch(url);
     if (!res.ok) { console.error(`[${symbolName}] HTTP ${res.status}`); return null; }
     return await res.json();
@@ -141,7 +139,7 @@ async function storeCandles(symbolName, candles) {
   return true;
 }
 
-// ── PROCESS ONE SYMBOL ──────────────────────
+// ── PROCESS SYMBOLS ─────────────────────────
 async function processSymbol(symbol) {
   const candles = await fetchCandles(symbol.symbol_name);
   if (!candles || candles.length === 0) return null;
@@ -167,37 +165,53 @@ async function processSymbolsBatch(symbols) {
     const batchResults = await Promise.all(batch.map(s => processSymbol(s)));
     results.push(...batchResults.filter(r => r !== null));
 
-    if (i + BATCH_SIZE < symbols.length) {
-      await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
-    }
+    if (i + BATCH_SIZE < symbols.length) await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
   }
   return results;
 }
 
-// ── BINANCE POSITIONS ───────────────────────
-async function fetchBinancePositions() {
+// ── BINANCE SPOT ACCOUNT (KEY OPTIONAL) ─────
+async function fetchBinanceSpotAccount() {
+  if (!HAS_BINANCE_KEY) {
+    console.log('No Binance API key — skipping account/positions fetch');
+    return [];
+  }
+
   try {
     const timestamp = Date.now();
     const queryString = `timestamp=${timestamp}`;
     const signature = crypto.createHmac('sha256', BINANCE_API_SECRET).update(queryString).digest('hex');
-    const url = `${BINANCE_BASE_URL}/fapi/v2/positionRisk?${queryString}&signature=${signature}`;
-    const response = await fetch(url, { headers: { 'X-MBX-APIKEY': BINANCE_API_KEY } });
+    const url = `${BINANCE_BASE_URL}/api/v3/account?${queryString}&signature=${signature}`;
 
-    if (!response.ok) { console.error('Binance error:', await response.text()); return []; }
+    const response = await fetch(url, { headers: { 'X-MBX-APIKEY': BINANCE_API_KEY } });
+    if (!response.ok) { console.error('Binance account error:', await response.text()); return []; }
 
     const data = await response.json();
-    return data
-      .filter(pos => parseFloat(pos.positionAmt) !== 0)
-      .map(pos => ({
-        symbol_name: pos.symbol,
-        quantity: parseFloat(pos.positionAmt),
-        entry_price: parseFloat(pos.entryPrice),
-        unrealized_pl: parseFloat(pos.unRealizedProfit),
-        side: pos.positionSide === 'BOTH' ? (parseFloat(pos.positionAmt) > 0 ? 'LONG' : 'SHORT') : pos.positionSide,
-        updated_at: new Date().toISOString()
-      }));
+
+    // Map balances to open_positions format
+    // Filter only USDT-tradable assets with balance > 0
+    const positions = [];
+    for (const b of data.balances) {
+      const free = parseFloat(b.free);
+      const locked = parseFloat(b.locked);
+      const total = free + locked;
+
+      if (total > 0 && b.asset !== 'USDT') {
+        // Try to match to our symbols (e.g. BTC -> BTCUSDT)
+        const symbolName = b.asset + 'USDT';
+        positions.push({
+          symbol_name: symbolName,
+          quantity: total,
+          entry_price: 0,
+          unrealized_pl: 0,
+          side: 'SPOT',
+          updated_at: new Date().toISOString()
+        });
+      }
+    }
+    return positions;
   } catch (err) {
-    console.error('Binance error:', err.message);
+    console.error('Binance account error:', err.message);
     return [];
   }
 }
@@ -231,7 +245,7 @@ async function runPoll() {
     const indicators = await processSymbolsBatch(symbols);
     await upsertIndicators(indicators);
 
-    const positions = await fetchBinancePositions();
+    const positions = await fetchBinanceSpotAccount();
     await upsertPositions(positions);
 
     console.log(`Poll complete in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
@@ -242,8 +256,9 @@ async function runPoll() {
 
 // ── START ───────────────────────────────────
 async function main() {
-  console.log('Self-Calculation Poller Started');
+  console.log('Spot Market Poller Started');
   console.log(`Interval: ${POLL_INTERVAL_MS / 60000} min | Candles: ${CANDLE_LIMIT} x ${TIMEFRAME}`);
+  console.log(`Binance key: ${HAS_BINANCE_KEY ? 'YES (positions enabled)' : 'NO (indicators only)'}`);
   await runPoll();
   setInterval(runPoll, POLL_INTERVAL_MS);
 }
